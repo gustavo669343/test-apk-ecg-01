@@ -47,6 +47,9 @@ class BleEcgClient(context: Context) {
     private val _status = MutableStateFlow("Chưa kết nối")
     val status = _status.asStateFlow()
 
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning = _isScanning.asStateFlow()
+
     private val _packets = MutableSharedFlow<EcgPacket>(extraBufferCapacity = 1024)
     val packets = _packets.asSharedFlow()
 
@@ -94,12 +97,14 @@ class BleEcgClient(context: Context) {
             return
         }
         scanning = true
+        _isScanning.value = true
         try {
             scanner.startScan(scanCallback.apply { found = onDevice })
             _status.value = "Đang quét thiết bị BLE..."
             scanHandler.postDelayed({ stopScan() }, 8_000)
         } catch (_: SecurityException) {
             scanning = false
+            _isScanning.value = false
             _status.value = "Thiếu quyền Bluetooth – hãy cấp quyền Thiết bị ở gần"
         }
     }
@@ -108,6 +113,7 @@ class BleEcgClient(context: Context) {
     fun stopScan() {
         if (!scanning) return
         scanning = false
+        _isScanning.value = false
         try {
             adapter?.bluetoothLeScanner?.stopScan(scanCallback)
         } catch (_: SecurityException) {}
@@ -126,6 +132,7 @@ class BleEcgClient(context: Context) {
 
         override fun onScanFailed(errorCode: Int) {
             scanning = false
+            _isScanning.value = false
             _status.value = "Quét BLE lỗi: $errorCode"
         }
     }

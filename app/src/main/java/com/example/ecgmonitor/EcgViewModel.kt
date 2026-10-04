@@ -85,13 +85,30 @@ class EcgViewModel(
     private val _selectedDevice = MutableStateFlow<BleDeviceOption?>(null)
     val selectedDevice = _selectedDevice.asStateFlow()
 
+    val isScanning = ble.isScanning
+
+    private val _isConnected = MutableStateFlow(false)
+    val isConnected = _isConnected.asStateFlow()
+
+    private val _connectionEvent = MutableSharedFlow<String>(extraBufferCapacity = 2)
+    val connectionEvent = _connectionEvent.asSharedFlow()
+
     val sessions: StateFlow<List<EcgSession>> = dao.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     init {
-        // Collect BLE status to update Mascot initial emotion
+        // Collect BLE status to track connection state and Mascot emotion
         viewModelScope.launch {
             status.collect { s ->
+                val connected = s.contains("Đã kết nối") || s.contains("Đang nhận")
+                if (connected && !_isConnected.value) {
+                    _isConnected.value = true
+                    val devName = _selectedDevice.value?.name ?: "ESP32"
+                    _connectionEvent.tryEmit("Đã kết nối thành công với $devName!")
+                    _currentGifAsset.value = "ami_happy.gif"
+                } else if (!connected && _isConnected.value) {
+                    _isConnected.value = false
+                }
                 updateMascotEmotion(s)
             }
         }

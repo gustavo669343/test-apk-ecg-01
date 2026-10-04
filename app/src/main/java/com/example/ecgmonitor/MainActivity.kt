@@ -13,10 +13,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -83,6 +85,8 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
     val androidFiltered by vm.androidFilteredWaveform.collectAsState()
 
     val status by vm.status.collectAsState()
+    val isConnected by vm.isConnected.collectAsState()
+    val isScanning by vm.isScanning.collectAsState()
     val assessment by vm.assessment.collectAsState()
     val sessions by vm.sessions.collectAsState()
     val devices by vm.devices.collectAsState()
@@ -99,6 +103,19 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
     var page by rememberSaveable { mutableIntStateOf(0) }
     var dark by rememberSaveable { mutableStateOf(true) }
     var english by rememberSaveable { mutableStateOf(false) }
+    var showConnectSheet by rememberSaveable { mutableStateOf(false) }
+
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    // Listen for connection success event to show floating notification
+    LaunchedEffect(Unit) {
+        vm.connectionEvent.collect { message ->
+            snackbarHostState.showSnackbar(
+                message = message,
+                duration = SnackbarDuration.Short
+            )
+        }
+    }
 
     val labels = if (english) {
         listOf("Home", "ECG Charts", "Trends", "Settings")
@@ -124,18 +141,51 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
 
     MaterialTheme(colorScheme = scheme) {
         Scaffold(
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 TopAppBar(
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                if (english) "ECG & Vital Signs Companion"
-                                else "ECG & Sinh Hiệu • Ami AI"
+                                if (english) "ECG Companion" else "ECG Sinh Hiệu",
+                                fontWeight = FontWeight.Bold
                             )
                             if (isPeak) {
                                 Spacer(Modifier.width(8.dp))
                                 Text("❤️", fontSize = 16.sp)
                             }
+                        }
+                    },
+                    actions = {
+                        // Bluetooth Quick Button in TopBar
+                        FilledTonalButton(
+                            onClick = {
+                                scan()
+                                showConnectSheet = true
+                            },
+                            shape = RoundedCornerShape(20.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = if (isConnected) Color(0x3300E5A8) else Color(0x33EF5350)
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        if (isConnected) Color(0xFF00E5A8) else Color(0xFFEF5350),
+                                        CircleShape
+                                    )
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = if (isConnected) (selected?.name ?: "Đã kết nối")
+                                else (if (english) "Connect" else "Kết nối"),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                            )
                         }
                     }
                 )
@@ -164,6 +214,11 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     samples = samples,
                     gifAsset = gifAsset,
                     isPeak = isPeak,
+                    isConnected = isConnected,
+                    onOpenConnect = {
+                        scan()
+                        showConnectSheet = true
+                    },
                     english = english
                 )
                 1 -> DetailScreen(
@@ -176,11 +231,13 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     spo2 = spo2,
                     ppgBpm = ppgBpm,
                     aiClassName = aiClassName,
-                    devices = devices,
                     selected = selected,
+                    isConnected = isConnected,
                     samples = samples,
-                    scan = scan,
-                    connect = vm::connectTo,
+                    onOpenConnect = {
+                        scan()
+                        showConnectSheet = true
+                    },
                     disconnect = vm::disconnect,
                     save = vm::saveCurrentMeasurement,
                     english = english
@@ -198,6 +255,25 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     onEnglish = { english = it }
                 )
             }
+
+            // Simplified Modal BottomSheet for Bluetooth Connection
+            if (showConnectSheet) {
+                BleConnectBottomSheet(
+                    devices = devices,
+                    selected = selected,
+                    isConnected = isConnected,
+                    isScanning = isScanning,
+                    status = status,
+                    onDismiss = { showConnectSheet = false },
+                    onScan = scan,
+                    onConnect = { dev ->
+                        vm.connectTo(dev)
+                        showConnectSheet = false
+                    },
+                    onDisconnect = vm::disconnect,
+                    english = english
+                )
+            }
         }
     }
 }
@@ -213,9 +289,11 @@ private fun HomeScreen(
     samples: Int,
     gifAsset: String,
     isPeak: Boolean,
+    isConnected: Boolean,
+    onOpenConnect: () -> Unit,
     english: Boolean
 ) {
-    val advice = if (assessment.bpm == null) {
+    val advice = if (!isConnected || assessment.bpm == null) {
         if (english) "Connect your ESP32-S3 ECG device to begin. Sit still and keep electrodes well contacted."
         else "Hãy kết nối thiết bị ESP32 ECG để bắt đầu. Ngồi yên và giữ điện cực tiếp xúc tốt nhé."
     } else {
@@ -229,6 +307,45 @@ private fun HomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Quick Connect Suggestion Card when not connected
+        if (!isConnected) {
+            Card(
+                onClick = onOpenConnect,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("⚡", fontSize = 22.sp)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                if (english) "Connect ECG Sensor" else "Kết nối thiết bị ECG",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                            Text(
+                                if (english) "Tap to pair with ESP32-S3 over BLE" else "Chạm để kết nối nhanh qua Bluetooth",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                            )
+                        }
+                    }
+                    Button(onClick = onOpenConnect) {
+                        Text(if (english) "Pair" else "Kết nối")
+                    }
+                }
+            }
+        }
+
         Text(
             if (english) "Hello! I am your AI ECG Companion"
             else "Xin chào, mình là Ami - Bạn đồng hành ECG",
@@ -420,17 +537,14 @@ private fun DetailScreen(
     spo2: Float?,
     ppgBpm: Float?,
     aiClassName: String?,
-    devices: List<BleDeviceOption>,
     selected: BleDeviceOption?,
+    isConnected: Boolean,
     samples: Int,
-    scan: () -> Unit,
-    connect: (BleDeviceOption) -> Unit,
+    onOpenConnect: () -> Unit,
     disconnect: () -> Unit,
     save: () -> Unit,
     english: Boolean
 ) {
-    var expanded by rememberSaveable { mutableStateOf(true) }
-
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -438,13 +552,59 @@ private fun DetailScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Streamlined Connection Header Card
+        Card {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .background(
+                                    if (isConnected) Color(0xFF00E5A8) else Color(0xFFEF5350),
+                                    CircleShape
+                                )
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            selected?.name ?: if (english) "Disconnected" else "Chưa kết nối",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilledTonalButton(onClick = onOpenConnect) {
+                        Text(
+                            if (isConnected) (if (english) "Change" else "Đổi thiết bị")
+                            else (if (english) "Connect" else "Kết nối")
+                        )
+                    }
+                    if (isConnected) {
+                        OutlinedButton(onClick = disconnect) {
+                            Text(if (english) "Disconnect" else "Ngắt", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            }
+        }
+
         Text(
             if (english) "Multi-Waveform Analysis & Comparison"
             else "Phân tích & So sánh Đa Đồ thị ECG",
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold
         )
-        Text(status, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
 
         // Waveform 1: Raw Signal from AD8232
         ChartPanel(
@@ -473,88 +633,6 @@ private fun DetailScreen(
             color = Color(0xFF4DD0E1)
         )
 
-        // BLE Connection Card
-        Card {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Bluetooth LE (ESP32-S3)",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    TextButton(onClick = { expanded = !expanded }) {
-                        Text(
-                            if (expanded) (if (english) "Collapse" else "Thu gọn")
-                            else (if (english) "Expand" else "Mở rộng")
-                        )
-                    }
-                }
-
-                Text(
-                    selected?.let { "${it.name} • ${it.address}" }
-                        ?: if (english) "No device connected" else "Chưa kết nối thiết bị",
-                    fontWeight = FontWeight.Medium
-                )
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = scan) {
-                        Text(if (english) "Scan again" else "Quét lại")
-                    }
-                    OutlinedButton(onClick = disconnect) {
-                        Text(if (english) "Disconnect" else "Ngắt kết nối")
-                    }
-                }
-
-                if (expanded) {
-                    if (devices.isEmpty()) {
-                        Text(
-                            if (english) "Scanning for ESP32_ECG_AI_Tester... Ensure Bluetooth is turned on."
-                            else "Đang tìm kiếm ESP32_ECG_AI_Tester... Hãy chắc chắn đã bật Bluetooth và cấp nguồn cho ESP32.",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    devices.forEach { d ->
-                        OutlinedButton(
-                            onClick = { connect(d) },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column {
-                                    Text(d.name, fontWeight = FontWeight.Bold)
-                                    Text(d.address, style = MaterialTheme.typography.labelSmall)
-                                }
-                                if (d.isRecommended) {
-                                    Surface(
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = MaterialTheme.colorScheme.primaryContainer
-                                    ) {
-                                        Text(
-                                            "ESP32 AI",
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // Summary Indicators Card
         Card {
             Column(
@@ -579,6 +657,159 @@ private fun DetailScreen(
             enabled = espFiltered.isNotEmpty()
         ) {
             Text(if (english) "Save current session to local database" else "Lưu phiên đo vào cơ sở dữ liệu")
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BleConnectBottomSheet(
+    devices: List<BleDeviceOption>,
+    selected: BleDeviceOption?,
+    isConnected: Boolean,
+    isScanning: Boolean,
+    status: String,
+    onDismiss: () -> Unit,
+    onScan: () -> Unit,
+    onConnect: (BleDeviceOption) -> Unit,
+    onDisconnect: () -> Unit,
+    english: Boolean
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        if (english) "Bluetooth Devices" else "Kết nối Thiết bị Bluetooth",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+                if (isScanning) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.5.dp)
+                } else {
+                    TextButton(onClick = onScan) {
+                        Text(if (english) "Scan again" else "Quét lại")
+                    }
+                }
+            }
+
+            if (devices.isEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .padding(24.dp)
+                            .fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("🔍", fontSize = 32.sp)
+                        Text(
+                            if (english) "Searching for ECG devices nearby..."
+                            else "Đang tìm thiết bị ECG xung quanh...",
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            if (english) "Make sure your ESP32-S3 is powered on."
+                            else "Hãy đảm bảo ESP32-S3 đã bật nguồn và đặt gần điện thoại.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Button(onClick = onScan) {
+                            Text(if (english) "Start scan" else "Bắt đầu quét")
+                        }
+                    }
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    devices.forEach { dev ->
+                        val isTarget = selected?.address == dev.address && isConnected
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isTarget) MaterialTheme.colorScheme.primaryContainer
+                                else if (dev.isRecommended) MaterialTheme.colorScheme.surfaceVariant
+                                else MaterialTheme.colorScheme.surface
+                            ),
+                            border = if (dev.isRecommended) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(if (dev.isRecommended) "🩺" else "📶", fontSize = 22.sp)
+                                    Spacer(Modifier.width(12.dp))
+                                    Column {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(dev.name, fontWeight = FontWeight.Bold)
+                                            if (dev.isRecommended) {
+                                                Spacer(Modifier.width(6.dp))
+                                                Surface(
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    color = MaterialTheme.colorScheme.primary
+                                                ) {
+                                                    Text(
+                                                        "Khuyên dùng",
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                        fontSize = 10.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = MaterialTheme.colorScheme.onPrimary
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Text(
+                                            dev.address,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.outline
+                                        )
+                                    }
+                                }
+
+                                if (isTarget) {
+                                    OutlinedButton(onClick = onDisconnect) {
+                                        Text(if (english) "Disconnect" else "Ngắt", color = MaterialTheme.colorScheme.error)
+                                    }
+                                } else {
+                                    Button(onClick = { onConnect(dev) }) {
+                                        Text(if (english) "Connect" else "Kết nối")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
         }
     }
 }
@@ -651,7 +882,9 @@ private fun TrendsScreen(modifier: Modifier, sessions: List<EcgSession>, english
             val bpm = values[index]
             Card {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -682,7 +915,9 @@ private fun SettingsScreen(
     onEnglish: (Boolean) -> Unit
 ) {
     Column(
-        modifier = modifier.fillMaxSize().padding(16.dp),
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
@@ -693,7 +928,9 @@ private fun SettingsScreen(
 
         Card {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -707,7 +944,9 @@ private fun SettingsScreen(
 
         Card {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
