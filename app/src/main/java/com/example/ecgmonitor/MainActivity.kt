@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -30,6 +31,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,7 +42,9 @@ import com.example.ecgmonitor.data.EcgDatabase
 import com.example.ecgmonitor.data.EcgSession
 import com.example.ecgmonitor.domain.EcgAssessment
 import com.example.ecgmonitor.domain.TfliteModelMeta
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -82,6 +86,9 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
     val raw by vm.rawWaveform.collectAsState()
     val espFiltered by vm.espFilteredWaveform.collectAsState()
     val androidFiltered by vm.androidFilteredWaveform.collectAsState()
@@ -116,6 +123,38 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
     var showConnectSheet by rememberSaveable { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // State for SAF CSV export
+    var pendingExportSession by remember { mutableStateOf<EcgSession?>(null) }
+    var isExportingCurrentSession by remember { mutableStateOf(false) }
+
+    val exportCsvLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        uri?.let {
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openOutputStream(it)?.use { stream ->
+                        if (isExportingCurrentSession) {
+                            vm.exportCurrentSessionToCsv(stream)
+                        } else {
+                            pendingExportSession?.let { s -> vm.exportSessionToCsv(s, stream) }
+                        }
+                    }
+                    snackbarHostState.showSnackbar(
+                        if (english) "CSV exported successfully!" else "Đã xuất tệp CSV thành công!"
+                    )
+                } catch (e: Exception) {
+                    snackbarHostState.showSnackbar(
+                        if (english) "Failed to export CSV: ${e.localizedMessage}" else "Lỗi khi xuất CSV: ${e.localizedMessage}"
+                    )
+                } finally {
+                    pendingExportSession = null
+                    isExportingCurrentSession = false
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         vm.connectionEvent.collect { message ->
@@ -278,11 +317,21 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     },
                     disconnect = vm::disconnect,
                     save = vm::saveCurrentMeasurement,
+                    onExportCurrentCsv = {
+                        isExportingCurrentSession = true
+                        pendingExportSession = null
+                        exportCsvLauncher.launch(vm.generateCsvFilename())
+                    },
                     english = english
                 )
                 2 -> TrendsScreen(
                     modifier = Modifier.padding(pad),
                     sessions = sessions,
+                    onExportSessionCsv = { session ->
+                        isExportingCurrentSession = false
+                        pendingExportSession = session
+                        exportCsvLauncher.launch(vm.generateCsvFilename(session.startedAt))
+                    },
                     english = english
                 )
                 else -> SettingsScreen(
@@ -361,7 +410,6 @@ private fun HomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Quick Connect Suggestion Card when not connected
         if (!isConnected) {
             Card(
                 onClick = onOpenConnect,
@@ -524,7 +572,6 @@ private fun HomeScreen(
                         }
                     }
 
-                    // Model Badge Details
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -630,7 +677,6 @@ private fun HomeScreen(
                     }
                 }
 
-                // AI Probability distribution bars (N, S, V, F, Q)
                 if (activeAiClassPercentages != null && activeAiClassPercentages.size >= 5) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                     Row(
@@ -653,13 +699,11 @@ private fun HomeScreen(
                     }
 
                     val classKeys = listOf("N", "S", "V", "F", "Q")
-                    val classLabels = listOf("Bình thường", "Sớm trên thất", "Ngoại tâm thất", "Kết hợp", "Không xác định")
                     val classColors = listOf(Color(0xFF00E5A8), Color(0xFFFFB74D), Color(0xFFE57373), Color(0xFFBA68C8), Color(0xFF90A4AE))
 
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         for (i in 0 until 5) {
                             val rawProb = activeAiClassPercentages.getOrNull(i) ?: 0f
-                            // Normalized percentage 0..100
                             val pct = if (rawProb in 0f..1f) rawProb * 100f else rawProb
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -764,6 +808,7 @@ private fun DetailScreen(
     onOpenConnect: () -> Unit,
     disconnect: () -> Unit,
     save: () -> Unit,
+    onExportCurrentCsv: () -> Unit,
     english: Boolean
 ) {
     Column(
@@ -872,12 +917,25 @@ private fun DetailScreen(
             }
         }
 
-        Button(
-            onClick = save,
+        // Action Buttons: Save to DB & Export CSV
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            enabled = espFiltered.isNotEmpty()
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(if (english) "Save current session to local database" else "Lưu phiên đo vào cơ sở dữ liệu")
+            OutlinedButton(
+                onClick = onExportCurrentCsv,
+                modifier = Modifier.weight(1f),
+                enabled = espFiltered.isNotEmpty()
+            ) {
+                Text(if (english) "📥 Export .CSV" else "📥 Xuất tệp .CSV")
+            }
+            Button(
+                onClick = save,
+                modifier = Modifier.weight(1f),
+                enabled = espFiltered.isNotEmpty()
+            ) {
+                Text(if (english) "💾 Save DB" else "💾 Lưu vào CSDL")
+            }
         }
     }
 }
@@ -1048,8 +1106,14 @@ private fun ChartPanel(title: String, subtitle: String, samples: List<Float>, co
 }
 
 @Composable
-private fun TrendsScreen(modifier: Modifier, sessions: List<EcgSession>, english: Boolean) {
+private fun TrendsScreen(
+    modifier: Modifier,
+    sessions: List<EcgSession>,
+    onExportSessionCsv: (EcgSession) -> Unit,
+    english: Boolean
+) {
     val formatter = remember { SimpleDateFormat("dd/MM", Locale.getDefault()) }
+    val fullDateFormatter = remember { SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault()) }
     val dates = remember {
         (0..6).map { Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -it) }.time }.reversed()
     }
@@ -1080,7 +1144,7 @@ private fun TrendsScreen(modifier: Modifier, sessions: List<EcgSession>, english
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Text(
             if (english) "7-Day Heart Rate Trends" else "Xu hướng nhịp tim 7 ngày",
@@ -1115,6 +1179,85 @@ private fun TrendsScreen(modifier: Modifier, sessions: List<EcgSession>, english
                         color = if (bpm == null) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Bold
                     )
+                }
+            }
+        }
+
+        // ==========================================
+        // SAVED SESSIONS HISTORY & CSV EXPORT LIST
+        // ==========================================
+        Text(
+            if (english) "Saved Sessions History & CSV Export" else "Lịch sử Phiên đo & Xuất tệp .CSV",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold
+        )
+
+        if (sessions.isEmpty()) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Text(
+                    if (english) "No saved sessions yet. Record in ECG Charts tab and save to export CSV anytime."
+                    else "Chưa có phiên đo nào được lưu. Hãy đo và bấm 'Lưu vào CSDL' hoặc 'Xuất .CSV' ở tab Đồ thị ECG.",
+                    modifier = Modifier.padding(16.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+        } else {
+            sessions.forEach { session ->
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    fullDateFormatter.format(Date(session.startedAt)),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(4.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer
+                                ) {
+                                    Text(
+                                        "${session.durationSeconds}s",
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "Nhịp tim: ${session.heartRateBpm ?: "--"} BPM • 125 Hz",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFE95454),
+                                fontWeight = FontWeight.Medium
+                            )
+                            if (session.note.isNotBlank()) {
+                                Text(
+                                    session.note,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                            }
+                        }
+                        FilledTonalButton(
+                            onClick = { onExportSessionCsv(session) },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(if (english) "📥 CSV" else "📥 Xuất CSV", fontSize = 12.sp)
+                        }
+                    }
                 }
             }
         }

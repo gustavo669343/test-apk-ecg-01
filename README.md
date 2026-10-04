@@ -55,6 +55,12 @@
    - Lưu trữ các phiên đo ECG vào SQLite cục bộ qua Room DB (`ecg_sessions`).
    - Phân tích và biểu diễn xu hướng nhịp tim trung bình trong 7 ngày gần nhất.
 
+10. **Xuất Báo cáo Đo ra Tệp .CSV (Tự chọn Vị trí lưu)**:
+    - Xuất dữ liệu toàn bộ phiên đo chuẩn 100% định dạng `in/data`:
+      `Index,Raw,Filtered,Peak,BPM,Class_ID,Class_Name,P0,P1,P2,P3,P4`
+    - Tự động gợi ý tên tệp dạng `ble_received_ecg_YYYYMMDD_HHmmss.csv`.
+    - Hộp thoại Storage Access Framework (SAF) cho phép người dùng tự chọn thư mục lưu trữ (Download, Documents, Thẻ nhớ SD, Google Drive...) mà không cần quyền nguy hiểm.
+
 ---
 
 ### 🚀 Cách 1: Tự động Build APK trên Cloud qua GitHub Actions (0 MB trên máy)

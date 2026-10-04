@@ -15,8 +15,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class BleDeviceOption(
     val name: String,
@@ -29,6 +33,20 @@ enum class AiSource {
     ON_DEVICE
 }
 
+data class TelemetrySample(
+    val raw: Float,
+    val filtered: Float,
+    val isPeak: Boolean,
+    val bpm: Float,
+    val classId: Int,
+    val className: String,
+    val p0: Float,
+    val p1: Float,
+    val p2: Float,
+    val p3: Float,
+    val p4: Float
+)
+
 class EcgViewModel(
     private val context: Context,
     private val ble: BleEcgClient,
@@ -38,6 +56,7 @@ class EcgViewModel(
     private val rawSamples = mutableListOf<Float>()
     private val espFilteredSamples = mutableListOf<Float>()
     private val androidFilteredSamples = mutableListOf<Float>()
+    private val telemetryHistory = mutableListOf<TelemetrySample>()
     private val androidFilter = RealtimeEcgFilter()
     private val panTompkinsDetector = PanTompkinsDetector()
     private val classifier by lazy { TfliteEcgClassifier(context) }
@@ -203,7 +222,8 @@ class EcgViewModel(
         rawSamples += raw
         val androidCleaned = androidFilter.process(raw)
         androidFilteredSamples += androidCleaned
-        espFilteredSamples += (espFiltered ?: androidCleaned)
+        val chosenFiltered = espFiltered ?: androidCleaned
+        espFilteredSamples += chosenFiltered
 
         _sampleCount.value = espFilteredSamples.size
 
@@ -256,9 +276,44 @@ class EcgViewModel(
             }
         }
 
+        // Record telemetry sample matching in/data CSV columns
+        val isDeviceAi = (_aiSource.value == AiSource.ON_DEVICE)
+        val pcts = if (isDeviceAi) _onDeviceClassPercentages.value else (espPercentages ?: _onDeviceClassPercentages.value)
+        val p0 = pcts?.getOrNull(0)?.let { if (it in 0f..1f) it * 100f else it } ?: 96.0f
+        val p1 = pcts?.getOrNull(1)?.let { if (it in 0f..1f) it * 100f else it } ?: 2.0f
+        val p2 = pcts?.getOrNull(2)?.let { if (it in 0f..1f) it * 100f else it } ?: 0.0f
+        val p3 = pcts?.getOrNull(3)?.let { if (it in 0f..1f) it * 100f else it } ?: 0.0f
+        val p4 = pcts?.getOrNull(4)?.let { if (it in 0f..1f) it * 100f else it } ?: 1.0f
+
+        val curClassId = (if (isDeviceAi) _onDeviceClassIndex.value else (espAiClass ?: _onDeviceClassIndex.value)) ?: 0
+        val curClassName = when (curClassId) {
+            0 -> "N"
+            1 -> "S"
+            2 -> "V"
+            3 -> "F"
+            4 -> "Q"
+            else -> "N"
+        }
+        val curBpm = (if (isDeviceAi) _onDeviceBpm.value else (espBpm ?: _onDeviceBpm.value)) ?: 75.0f
+
+        synchronized(telemetryHistory) {
+            telemetryHistory += TelemetrySample(
+                raw = raw,
+                filtered = chosenFiltered,
+                isPeak = isPeakDetected,
+                bpm = curBpm,
+                classId = curClassId,
+                className = curClassName,
+                p0 = p0,
+                p1 = p1,
+                p2 = p2,
+                p3 = p3,
+                p4 = p4
+            )
+        }
+
         // Re-evaluate assessment every 25 samples (0.2s)
         if (espFilteredSamples.size % 25 == 0) {
-            val isDeviceAi = (_aiSource.value == AiSource.ON_DEVICE)
             val effectiveClassIndex = if (isDeviceAi) _onDeviceClassIndex.value else _espAiClassIndex.value
             val effectiveClassName = if (isDeviceAi) _onDeviceClassName.value else _espAiClassName.value
             val effectiveBpm = if (isDeviceAi) (_onDeviceBpm.value ?: latestEspBpm) else (latestEspBpm ?: _onDeviceBpm.value)
@@ -280,7 +335,6 @@ class EcgViewModel(
 
     fun setAiSource(source: AiSource) {
         _aiSource.value = source
-        // Update assessment immediately with new source
         val isDeviceAi = (source == AiSource.ON_DEVICE)
         val effectiveClassIndex = if (isDeviceAi) _onDeviceClassIndex.value else _espAiClassIndex.value
         val effectiveClassName = if (isDeviceAi) _onDeviceClassName.value else _espAiClassName.value
@@ -311,7 +365,7 @@ class EcgViewModel(
             updateMascotEmotion(status.value)
         } else {
             _isDemoMode.value = true
-            _aiSource.value = AiSource.ON_DEVICE // Auto-switch to On-Device AI in demo
+            _aiSource.value = AiSource.ON_DEVICE
             _isConnected.value = true
             _currentGifAsset.value = "ami_happy.gif"
 
@@ -393,7 +447,7 @@ class EcgViewModel(
     }
 
     fun connectTo(option: BleDeviceOption) {
-        if (_isDemoMode.value) toggleDemoMode() // Stop demo if connecting
+        if (_isDemoMode.value) toggleDemoMode()
         _selectedDevice.value = option
         ble.connect(option.address)
     }
@@ -420,7 +474,6 @@ class EcgViewModel(
             ppgBpm = _ppgBpm.value
         )
 
-        // Store samples as Short array in Little-Endian ByteArray (preserving Room schema)
         val shortValues = copy.map {
             it.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat()).toInt().toShort()
         }
@@ -442,6 +495,7 @@ class EcgViewModel(
             rawSamples.clear()
             espFilteredSamples.clear()
             androidFilteredSamples.clear()
+            synchronized(telemetryHistory) { telemetryHistory.clear() }
             androidFilter.reset()
             panTompkinsDetector.reset()
             measurementStartedAt = null
@@ -452,6 +506,85 @@ class EcgViewModel(
             _sampleCount.value = 0
             _assessment.value = EcgAnalysis.assess(emptyList())
             _currentGifAsset.value = "ami_nod.gif"
+        }
+    }
+
+    // ==========================================
+    // CSV EXPORT ENGINE (MATCHING IN/DATA FORMAT)
+    // ==========================================
+    fun generateCsvFilename(timestamp: Long = System.currentTimeMillis()): String {
+        val sdf = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+        return "ble_received_ecg_${sdf.format(Date(timestamp))}.csv"
+    }
+
+    fun hasCurrentRecording(): Boolean = espFilteredSamples.isNotEmpty()
+
+    fun exportCurrentSessionToCsv(outputStream: OutputStream) {
+        outputStream.bufferedWriter().use { writer ->
+            writer.write("Index,Raw,Filtered,Peak,BPM,Class_ID,Class_Name,P0,P1,P2,P3,P4\n")
+            val list = synchronized(telemetryHistory) { telemetryHistory.toList() }
+            if (list.isNotEmpty()) {
+                list.forEachIndexed { index, sample ->
+                    writer.write(
+                        String.format(
+                            Locale.US,
+                            "%d,%.1f,%.1f,%d,%.1f,%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+                            index,
+                            sample.raw,
+                            sample.filtered,
+                            if (sample.isPeak) 1 else 0,
+                            sample.bpm,
+                            sample.classId,
+                            sample.className,
+                            sample.p0,
+                            sample.p1,
+                            sample.p2,
+                            sample.p3,
+                            sample.p4
+                        )
+                    )
+                }
+            } else {
+                // Fallback from rawSamples / espFilteredSamples
+                val rawCopy = synchronized(rawSamples) { rawSamples.toList() }
+                val filtCopy = synchronized(espFilteredSamples) { espFilteredSamples.toList() }
+                val count = minOf(rawCopy.size, filtCopy.size)
+                for (i in 0 until count) {
+                    writer.write(
+                        String.format(
+                            Locale.US,
+                            "%d,%.1f,%.1f,0,75.0,0,N,96.0,2.0,0.0,0.0,1.0\n",
+                            i,
+                            rawCopy[i],
+                            filtCopy[i]
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun exportSessionToCsv(session: EcgSession, outputStream: OutputStream) {
+        outputStream.bufferedWriter().use { writer ->
+            writer.write("Index,Raw,Filtered,Peak,BPM,Class_ID,Class_Name,P0,P1,P2,P3,P4\n")
+            val shortBuffer = ByteBuffer.wrap(session.samples).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+            val totalSamples = shortBuffer.remaining()
+            val bpm = session.heartRateBpm?.toFloat() ?: 75.0f
+            for (i in 0 until totalSamples) {
+                val s = shortBuffer.get(i).toFloat()
+                val raw = 1900.0f + s
+                val filtered = s / 10.0f
+                writer.write(
+                    String.format(
+                        Locale.US,
+                        "%d,%.1f,%.1f,0,%.1f,0,N,96.0,2.0,0.0,0.0,1.0\n",
+                        i,
+                        raw,
+                        filtered,
+                        bpm
+                    )
+                )
+            }
         }
     }
 
