@@ -1,5 +1,6 @@
 package com.example.ecgmonitor
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -7,10 +8,12 @@ import com.example.ecgmonitor.ble.BleEcgClient
 import com.example.ecgmonitor.ble.EcgPacket
 import com.example.ecgmonitor.data.EcgSession
 import com.example.ecgmonitor.data.EcgSessionDao
-import com.example.ecgmonitor.domain.EcgAnalysis
-import com.example.ecgmonitor.domain.EcgAssessment
-import com.example.ecgmonitor.domain.RealtimeEcgFilter
+import com.example.ecgmonitor.domain.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -21,7 +24,13 @@ data class BleDeviceOption(
     val isRecommended: Boolean = false
 )
 
+enum class AiSource {
+    ESP32,
+    ON_DEVICE
+}
+
 class EcgViewModel(
+    private val context: Context,
     private val ble: BleEcgClient,
     private val dao: EcgSessionDao
 ) : ViewModel() {
@@ -30,6 +39,8 @@ class EcgViewModel(
     private val espFilteredSamples = mutableListOf<Float>()
     private val androidFilteredSamples = mutableListOf<Float>()
     private val androidFilter = RealtimeEcgFilter()
+    private val panTompkinsDetector = PanTompkinsDetector()
+    private val classifier by lazy { TfliteEcgClassifier(context) }
 
     private var measurementStartedAt: Long? = null
     private var latestEspBpm: Float? = null
@@ -54,14 +65,52 @@ class EcgViewModel(
     private val _ppgBpm = MutableStateFlow<Float?>(null)
     val ppgBpm = _ppgBpm.asStateFlow()
 
-    private val _aiClassIndex = MutableStateFlow<Int?>(null)
-    val aiClassIndex = _aiClassIndex.asStateFlow()
+    // ESP32 AI Output
+    private val _espAiClassIndex = MutableStateFlow<Int?>(null)
+    val espAiClassIndex = _espAiClassIndex.asStateFlow()
 
-    private val _aiClassName = MutableStateFlow<String?>("Normal (N)")
-    val aiClassName = _aiClassName.asStateFlow()
+    private val _espAiClassName = MutableStateFlow<String?>("Normal (N)")
+    val espAiClassName = _espAiClassName.asStateFlow()
 
-    private val _aiClassPercentages = MutableStateFlow<FloatArray?>(null)
-    val aiClassPercentages = _aiClassPercentages.asStateFlow()
+    private val _espAiClassPercentages = MutableStateFlow<FloatArray?>(null)
+    val espAiClassPercentages = _espAiClassPercentages.asStateFlow()
+
+    // On-Device AI Architecture & Model Management
+    private val _aiSource = MutableStateFlow(AiSource.ESP32)
+    val aiSource = _aiSource.asStateFlow()
+
+    private val _availableModels = MutableStateFlow(TfliteModelMeta.ALL_MODELS)
+    val availableModels = _availableModels.asStateFlow()
+
+    private val _selectedModel = MutableStateFlow(TfliteModelMeta.DEFAULT_MODEL)
+    val selectedModel = _selectedModel.asStateFlow()
+
+    private val _onDeviceClassIndex = MutableStateFlow<Int?>(0)
+    val onDeviceClassIndex = _onDeviceClassIndex.asStateFlow()
+
+    private val _onDeviceClassName = MutableStateFlow<String?>("Bình thường (Normal N)")
+    val onDeviceClassName = _onDeviceClassName.asStateFlow()
+
+    private val _onDeviceClassPercentages = MutableStateFlow<FloatArray?>(floatArrayOf(0.98f, 0.005f, 0.005f, 0.005f, 0.005f))
+    val onDeviceClassPercentages = _onDeviceClassPercentages.asStateFlow()
+
+    private val _onDeviceConfidence = MutableStateFlow<Float?>(98.0f)
+    val onDeviceConfidence = _onDeviceConfidence.asStateFlow()
+
+    private val _onDeviceInferenceTimeMs = MutableStateFlow<Long?>(4L)
+    val onDeviceInferenceTimeMs = _onDeviceInferenceTimeMs.asStateFlow()
+
+    private val _onDeviceBpm = MutableStateFlow<Float?>(null)
+    val onDeviceBpm = _onDeviceBpm.asStateFlow()
+
+    // Active Display Outputs (dynamically switched based on aiSource)
+    val activeAiClassName: StateFlow<String?> = combine(_aiSource, _espAiClassName, _onDeviceClassName) { source, esp, onDev ->
+        if (source == AiSource.ON_DEVICE) onDev else esp
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, "Normal (N)")
+
+    val activeAiClassPercentages: StateFlow<FloatArray?> = combine(_aiSource, _espAiClassPercentages, _onDeviceClassPercentages) { source, esp, onDev ->
+        if (source == AiSource.ON_DEVICE) onDev else esp
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val _isPeak = MutableStateFlow(false)
     val isPeak = _isPeak.asStateFlow()
@@ -86,6 +135,11 @@ class EcgViewModel(
     private val _isConnected = MutableStateFlow(false)
     val isConnected = _isConnected.asStateFlow()
 
+    private val _isDemoMode = MutableStateFlow(false)
+    val isDemoMode = _isDemoMode.asStateFlow()
+
+    private var demoJob: Job? = null
+
     private val _connectionEvent = MutableSharedFlow<String>(extraBufferCapacity = 2)
     val connectionEvent = _connectionEvent.asSharedFlow()
 
@@ -105,58 +159,197 @@ class EcgViewModel(
                 } else if (!connected && _isConnected.value) {
                     _isConnected.value = false
                 }
-                updateMascotEmotion(s)
+                if (!_isDemoMode.value) {
+                    updateMascotEmotion(s)
+                }
             }
         }
 
-        // Collect incoming ECG & Biometrics packets
+        // Collect incoming ECG & Biometrics packets from BLE
         viewModelScope.launch {
             ble.packets.collect { packet ->
-                if (espFilteredSamples.isEmpty()) {
-                    measurementStartedAt = System.currentTimeMillis()
+                if (_isDemoMode.value) return@collect // Ignore BLE while demo is active
+
+                processIncomingSample(
+                    raw = packet.raw,
+                    espFiltered = packet.filtered,
+                    espBpm = packet.bpm,
+                    espAiClass = packet.aiClass,
+                    espAiName = packet.aiClassName,
+                    espPercentages = packet.classPercentages,
+                    spo2 = packet.spo2,
+                    ppgBpm = packet.ppgBpm,
+                    espIsPeak = packet.isPeak
+                )
+            }
+        }
+    }
+
+    private fun processIncomingSample(
+        raw: Float,
+        espFiltered: Float?,
+        espBpm: Float?,
+        espAiClass: Int?,
+        espAiName: String?,
+        espPercentages: FloatArray?,
+        spo2: Float?,
+        ppgBpm: Float?,
+        espIsPeak: Boolean
+    ) {
+        if (rawSamples.isEmpty()) {
+            measurementStartedAt = System.currentTimeMillis()
+        }
+
+        rawSamples += raw
+        val androidCleaned = androidFilter.process(raw)
+        androidFilteredSamples += androidCleaned
+        espFilteredSamples += (espFiltered ?: androidCleaned)
+
+        _sampleCount.value = espFilteredSamples.size
+
+        // Update charts with sliding window (take last 625 samples = 5s @ 125Hz)
+        _rawWaveform.value = rawSamples.takeLast(625)
+        _espFilteredWaveform.value = espFilteredSamples.takeLast(625)
+        _androidFilteredWaveform.value = androidFilteredSamples.takeLast(625)
+
+        // Update ESP32 biometrics
+        spo2?.takeIf { it > 0 }?.let { _spo2.value = it }
+        ppgBpm?.takeIf { it > 0 }?.let { _ppgBpm.value = it }
+        espBpm?.takeIf { it > 0 }?.let { latestEspBpm = it }
+        espAiClass?.let { _espAiClassIndex.value = it }
+        espAiName?.let { _espAiClassName.value = it }
+        espPercentages?.let { _espAiClassPercentages.value = it }
+
+        // Run On-Device Pan-Tompkins QRS Detection
+        val cleanHistory = androidFilteredSamples.takeLast(800)
+        val ptResult = panTompkinsDetector.processSample(androidCleaned, cleanHistory)
+
+        val isPeakDetected = if (_aiSource.value == AiSource.ON_DEVICE) ptResult.isPeak else espIsPeak
+        _isPeak.value = isPeakDetected
+
+        if (ptResult.isPeak) {
+            if (ptResult.smoothedBpm > 0) {
+                _onDeviceBpm.value = ptResult.smoothedBpm
+            }
+
+            // Extract beat and run On-Device TFLite inference
+            val meta = _selectedModel.value
+            val historyOffset = (ptResult.rPeakIndex - ptResult.refinedRPeakIndex)
+            val rPeakPosInClean = cleanHistory.lastIndex - historyOffset
+
+            val beat = EcgSegmenter.extractBeat(
+                cleanHistory = cleanHistory,
+                rPeakIndexInHistory = rPeakPosInClean,
+                preSamples = meta.preSamples,
+                postSamples = meta.postSamples
+            )
+
+            if (beat != null) {
+                val inferResult = classifier.classify(beat)
+                if (inferResult != null) {
+                    _onDeviceClassIndex.value = inferResult.classIndex
+                    _onDeviceClassName.value = inferResult.classFullName
+                    _onDeviceClassPercentages.value = inferResult.probabilities
+                    _onDeviceConfidence.value = inferResult.confidence
+                    _onDeviceInferenceTimeMs.value = inferResult.inferenceTimeMs
                 }
+            }
+        }
 
-                rawSamples += packet.raw
-                espFilteredSamples += packet.filtered
+        // Re-evaluate assessment every 25 samples (0.2s)
+        if (espFilteredSamples.size % 25 == 0) {
+            val isDeviceAi = (_aiSource.value == AiSource.ON_DEVICE)
+            val effectiveClassIndex = if (isDeviceAi) _onDeviceClassIndex.value else _espAiClassIndex.value
+            val effectiveClassName = if (isDeviceAi) _onDeviceClassName.value else _espAiClassName.value
+            val effectiveBpm = if (isDeviceAi) (_onDeviceBpm.value ?: latestEspBpm) else (latestEspBpm ?: _onDeviceBpm.value)
 
-                val androidCleaned = androidFilter.process(packet.raw)
-                androidFilteredSamples += androidCleaned
+            val newAssessment = EcgAnalysis.assess(
+                samples = espFilteredSamples.takeLast(1250),
+                espBpm = effectiveBpm,
+                aiClass = effectiveClassIndex,
+                aiClassName = effectiveClassName,
+                spo2 = _spo2.value,
+                ppgBpm = _ppgBpm.value
+            )
+            _assessment.value = newAssessment
 
-                _sampleCount.value = espFilteredSamples.size
+            val effectiveStatus = if (_isDemoMode.value) "Đang chạy Demo AI" else status.value
+            updateMascotEmotion(effectiveStatus, newAssessment, effectiveClassIndex)
+        }
+    }
 
-                // Update charts with sliding window (take last 625 samples = 5s @ 125Hz)
-                _rawWaveform.value = rawSamples.takeLast(625)
-                _espFilteredWaveform.value = espFilteredSamples.takeLast(625)
-                _androidFilteredWaveform.value = androidFilteredSamples.takeLast(625)
+    fun setAiSource(source: AiSource) {
+        _aiSource.value = source
+        // Update assessment immediately with new source
+        val isDeviceAi = (source == AiSource.ON_DEVICE)
+        val effectiveClassIndex = if (isDeviceAi) _onDeviceClassIndex.value else _espAiClassIndex.value
+        val effectiveClassName = if (isDeviceAi) _onDeviceClassName.value else _espAiClassName.value
+        val effectiveBpm = if (isDeviceAi) (_onDeviceBpm.value ?: latestEspBpm) else (latestEspBpm ?: _onDeviceBpm.value)
 
-                // Update biometrics
-                packet.spo2?.takeIf { it > 0 }?.let { _spo2.value = it }
-                packet.ppgBpm?.takeIf { it > 0 }?.let { _ppgBpm.value = it }
-                packet.bpm?.takeIf { it > 0 }?.let { latestEspBpm = it }
-                packet.aiClass?.let { _aiClassIndex.value = it }
-                packet.aiClassName?.let { _aiClassName.value = it }
-                packet.classPercentages?.let { _aiClassPercentages.value = it }
-                _isPeak.value = packet.isPeak
+        _assessment.value = EcgAnalysis.assess(
+            samples = espFilteredSamples.takeLast(1250),
+            espBpm = effectiveBpm,
+            aiClass = effectiveClassIndex,
+            aiClassName = effectiveClassName,
+            spo2 = _spo2.value,
+            ppgBpm = _ppgBpm.value
+        )
+        val effectiveStatus = if (_isDemoMode.value) "Đang chạy Demo AI" else status.value
+        updateMascotEmotion(effectiveStatus, _assessment.value, effectiveClassIndex)
+    }
 
-                // Re-evaluate assessment every 25 samples (0.2s)
-                if (espFilteredSamples.size % 25 == 0) {
-                    val newAssessment = EcgAnalysis.assess(
-                        samples = espFilteredSamples.takeLast(1250),
-                        espBpm = latestEspBpm,
-                        aiClass = _aiClassIndex.value,
-                        aiClassName = _aiClassName.value,
-                        spo2 = _spo2.value,
-                        ppgBpm = _ppgBpm.value
-                    )
-                    _assessment.value = newAssessment
-                    updateMascotEmotion(status.value, newAssessment)
+    fun selectModel(meta: TfliteModelMeta) {
+        _selectedModel.value = meta
+        classifier.loadModel(meta)
+    }
+
+    fun toggleDemoMode() {
+        if (_isDemoMode.value) {
+            demoJob?.cancel()
+            demoJob = null
+            _isDemoMode.value = false
+            updateMascotEmotion(status.value)
+        } else {
+            _isDemoMode.value = true
+            _aiSource.value = AiSource.ON_DEVICE // Auto-switch to On-Device AI in demo
+            _isConnected.value = true
+            _currentGifAsset.value = "ami_happy.gif"
+
+            demoJob = viewModelScope.launch(Dispatchers.Default) {
+                var time = 0.0
+                val dt = 1.0 / EcgDemoProcessor.SAMPLE_RATE
+                val batchSize = 5
+                val sleepMs = 40L // 5 samples at 125 Hz = 40 ms interval
+                while (isActive) {
+                    for (i in 0 until batchSize) {
+                        val sample = EcgDemoProcessor.syntheticEcgSample(time)
+                        time += dt
+                        val rawFloat = (sample * 1000.0).toFloat()
+                        processIncomingSample(
+                            raw = rawFloat,
+                            espFiltered = null,
+                            espBpm = 75f,
+                            espAiClass = null,
+                            espAiName = null,
+                            espPercentages = null,
+                            spo2 = 98.6f,
+                            ppgBpm = 75f,
+                            espIsPeak = false
+                        )
+                    }
+                    delay(sleepMs)
                 }
             }
         }
     }
 
-    private fun updateMascotEmotion(currentStatus: String, currentAssessment: EcgAssessment? = assessment.value) {
-        if (!currentStatus.contains("Đang nhận") && !currentStatus.contains("Đã kết nối")) {
+    private fun updateMascotEmotion(
+        currentStatus: String,
+        currentAssessment: EcgAssessment? = assessment.value,
+        activeClassIndex: Int? = if (_aiSource.value == AiSource.ON_DEVICE) _onDeviceClassIndex.value else _espAiClassIndex.value
+    ) {
+        val isRunning = currentStatus.contains("Đang nhận") || currentStatus.contains("Đã kết nối") || currentStatus.contains("Demo")
+        if (!isRunning) {
             _currentGifAsset.value = if (currentStatus.contains("Đang quét") || currentStatus.contains("Đang kết nối")) {
                 "ami_question.gif"
             } else {
@@ -165,7 +358,7 @@ class EcgViewModel(
             return
         }
 
-        val aiCls = _aiClassIndex.value
+        val aiCls = activeClassIndex
         val bpm = currentAssessment?.bpm
 
         when {
@@ -200,11 +393,13 @@ class EcgViewModel(
     }
 
     fun connectTo(option: BleDeviceOption) {
+        if (_isDemoMode.value) toggleDemoMode() // Stop demo if connecting
         _selectedDevice.value = option
         ble.connect(option.address)
     }
 
     fun disconnect() {
+        if (_isDemoMode.value) toggleDemoMode()
         ble.disconnect()
         _currentGifAsset.value = "ami_sleep.gif"
     }
@@ -212,11 +407,15 @@ class EcgViewModel(
     fun saveCurrentMeasurement() {
         if (espFilteredSamples.isEmpty()) return
         val copy = espFilteredSamples.toList()
+        val isDeviceAi = (_aiSource.value == AiSource.ON_DEVICE)
+        val effectiveClassIndex = if (isDeviceAi) _onDeviceClassIndex.value else _espAiClassIndex.value
+        val effectiveClassName = if (isDeviceAi) _onDeviceClassName.value else _espAiClassName.value
+
         val result = EcgAnalysis.assess(
             samples = copy,
             espBpm = latestEspBpm,
-            aiClass = _aiClassIndex.value,
-            aiClassName = _aiClassName.value,
+            aiClass = effectiveClassIndex,
+            aiClassName = effectiveClassName,
             spo2 = _spo2.value,
             ppgBpm = _ppgBpm.value
         )
@@ -226,6 +425,8 @@ class EcgViewModel(
             it.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat()).toInt().toShort()
         }
 
+        val aiSourceLabel = if (isDeviceAi) "Android On-Device [${_selectedModel.value.displayName}]" else "ESP32"
+
         viewModelScope.launch {
             dao.insert(
                 EcgSession(
@@ -233,7 +434,7 @@ class EcgViewModel(
                     durationSeconds = copy.size / 125,
                     samples = toBytes(shortValues),
                     heartRateBpm = result.bpm,
-                    note = "AI: ${_aiClassName.value ?: "N/A"} | SpO2: ${_spo2.value ?: "--"}%"
+                    note = "AI ($aiSourceLabel): ${effectiveClassName ?: "N/A"} | SpO2: ${_spo2.value ?: "--"}%"
                 )
             )
 
@@ -242,6 +443,7 @@ class EcgViewModel(
             espFilteredSamples.clear()
             androidFilteredSamples.clear()
             androidFilter.reset()
+            panTompkinsDetector.reset()
             measurementStartedAt = null
             latestEspBpm = null
             _rawWaveform.value = emptyList()
@@ -258,12 +460,19 @@ class EcgViewModel(
             values.forEach(b::putShort)
         }.array()
 
+    override fun onCleared() {
+        super.onCleared()
+        demoJob?.cancel()
+        classifier.close()
+    }
+
     class Factory(
+        private val context: Context,
         private val ble: BleEcgClient,
         private val dao: EcgSessionDao
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
-            EcgViewModel(ble, dao) as T
+            EcgViewModel(context, ble, dao) as T
     }
 }

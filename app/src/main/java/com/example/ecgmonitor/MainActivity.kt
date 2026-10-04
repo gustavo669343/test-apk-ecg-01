@@ -39,6 +39,7 @@ import com.example.ecgmonitor.ble.BleEcgClient
 import com.example.ecgmonitor.data.EcgDatabase
 import com.example.ecgmonitor.data.EcgSession
 import com.example.ecgmonitor.domain.EcgAssessment
+import com.example.ecgmonitor.domain.TfliteModelMeta
 import kotlinx.coroutines.flow.*
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -49,7 +50,7 @@ import kotlin.math.max
 class MainActivity : ComponentActivity() {
     private val database by lazy { EcgDatabase.create(this) }
     private val vm by viewModels<EcgViewModel> {
-        EcgViewModel.Factory(BleEcgClient(this), database.sessionDao())
+        EcgViewModel.Factory(this, BleEcgClient(this), database.sessionDao())
     }
 
     private val permissions = registerForActivityResult(
@@ -96,10 +97,18 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
 
     val spo2 by vm.spo2.collectAsState()
     val ppgBpm by vm.ppgBpm.collectAsState()
-    val aiClassName by vm.aiClassName.collectAsState()
-    val aiClassPercentages by vm.aiClassPercentages.collectAsState()
+    val activeAiClassName by vm.activeAiClassName.collectAsState()
+    val activeAiClassPercentages by vm.activeAiClassPercentages.collectAsState()
     val isPeak by vm.isPeak.collectAsState()
     val gifAsset by vm.currentGifAsset.collectAsState()
+
+    // Dual AI Source and TFLite Model State
+    val aiSource by vm.aiSource.collectAsState()
+    val availableModels by vm.availableModels.collectAsState()
+    val selectedModel by vm.selectedModel.collectAsState()
+    val isDemoMode by vm.isDemoMode.collectAsState()
+    val onDeviceConfidence by vm.onDeviceConfidence.collectAsState()
+    val onDeviceInferenceTimeMs by vm.onDeviceInferenceTimeMs.collectAsState()
 
     var page by rememberSaveable { mutableIntStateOf(0) }
     var dark by rememberSaveable { mutableStateOf(true) }
@@ -108,7 +117,6 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
 
     val snackbarHostState = remember { SnackbarHostState() }
 
-    // Listen for connection success event to show floating notification
     LaunchedEffect(Unit) {
         vm.connectionEvent.collect { message ->
             snackbarHostState.showSnackbar(
@@ -148,7 +156,7 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                if (english) "ECG Companion" else "ECG Sinh Hiệu",
+                                if (english) "ECG Companion" else "ECG Sinh Hiệu AI",
                                 fontWeight = FontWeight.Bold
                             )
                             if (isPeak) {
@@ -158,6 +166,25 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                         }
                     },
                     actions = {
+                        // Demo Mode Quick Toggle
+                        FilterChip(
+                            selected = isDemoMode,
+                            onClick = vm::toggleDemoMode,
+                            label = {
+                                Text(
+                                    if (isDemoMode) (if (english) "🧪 Demo: ON" else "🧪 Demo: BẬT")
+                                    else (if (english) "🧪 Demo" else "🧪 Chạy thử"),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0x3300E5A8),
+                                selectedLabelColor = MaterialTheme.colorScheme.primary
+                            ),
+                            modifier = Modifier.padding(end = 6.dp)
+                        )
+
                         // Bluetooth Quick Button in TopBar
                         FilledTonalButton(
                             onClick = {
@@ -166,7 +193,7 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                             },
                             shape = RoundedCornerShape(20.dp),
                             colors = ButtonDefaults.filledTonalButtonColors(
-                                containerColor = if (isConnected) Color(0x3300E5A8) else Color(0x33EF5350)
+                                containerColor = if (isConnected || isDemoMode) Color(0x3300E5A8) else Color(0x33EF5350)
                             ),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.padding(end = 8.dp)
@@ -175,17 +202,18 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                                 modifier = Modifier
                                     .size(8.dp)
                                     .background(
-                                        if (isConnected) Color(0xFF00E5A8) else Color(0xFFEF5350),
+                                        if (isConnected || isDemoMode) Color(0xFF00E5A8) else Color(0xFFEF5350),
                                         CircleShape
                                     )
                             )
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                text = if (isConnected) (selected?.name ?: "Đã kết nối")
+                                text = if (isDemoMode) (if (english) "Demo Mode" else "Chế độ Demo")
+                                else if (isConnected) (selected?.name ?: "Đã kết nối")
                                 else (if (english) "Connect" else "Kết nối"),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                color = if (isConnected || isDemoMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                             )
                         }
                     }
@@ -210,12 +238,21 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     assessment = assessment,
                     spo2 = spo2,
                     ppgBpm = ppgBpm,
-                    aiClassName = aiClassName,
-                    aiClassPercentages = aiClassPercentages,
+                    activeAiClassName = activeAiClassName,
+                    activeAiClassPercentages = activeAiClassPercentages,
+                    aiSource = aiSource,
+                    onSelectAiSource = vm::setAiSource,
+                    availableModels = availableModels,
+                    selectedModel = selectedModel,
+                    onSelectModel = vm::selectModel,
+                    onDeviceConfidence = onDeviceConfidence,
+                    onDeviceInferenceTimeMs = onDeviceInferenceTimeMs,
                     samples = samples,
                     gifAsset = gifAsset,
                     isPeak = isPeak,
-                    isConnected = isConnected,
+                    isConnected = isConnected || isDemoMode,
+                    isDemoMode = isDemoMode,
+                    onToggleDemo = vm::toggleDemoMode,
                     onOpenConnect = {
                         scan()
                         showConnectSheet = true
@@ -227,13 +264,13 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     raw = raw,
                     espFiltered = espFiltered,
                     androidFiltered = androidFiltered,
-                    status = status,
+                    status = if (isDemoMode) "Chế độ mô phỏng Demo ECG 125Hz" else status,
                     assessment = assessment,
                     spo2 = spo2,
                     ppgBpm = ppgBpm,
-                    aiClassName = aiClassName,
+                    aiClassName = activeAiClassName,
                     selected = selected,
-                    isConnected = isConnected,
+                    isConnected = isConnected || isDemoMode,
                     samples = samples,
                     onOpenConnect = {
                         scan()
@@ -253,11 +290,15 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
                     dark = dark,
                     onDark = { dark = it },
                     english = english,
-                    onEnglish = { english = it }
+                    onEnglish = { english = it },
+                    isDemoMode = isDemoMode,
+                    onToggleDemo = vm::toggleDemoMode,
+                    selectedModel = selectedModel,
+                    availableModels = availableModels,
+                    onSelectModel = vm::selectModel
                 )
             }
 
-            // Simplified Modal BottomSheet for Bluetooth Connection
             if (showConnectSheet) {
                 BleConnectBottomSheet(
                     devices = devices,
@@ -279,27 +320,39 @@ private fun EcgApp(vm: EcgViewModel, scan: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(
     modifier: Modifier,
     assessment: EcgAssessment,
     spo2: Float?,
     ppgBpm: Float?,
-    aiClassName: String?,
-    aiClassPercentages: FloatArray?,
+    activeAiClassName: String?,
+    activeAiClassPercentages: FloatArray?,
+    aiSource: AiSource,
+    onSelectAiSource: (AiSource) -> Unit,
+    availableModels: List<TfliteModelMeta>,
+    selectedModel: TfliteModelMeta,
+    onSelectModel: (TfliteModelMeta) -> Unit,
+    onDeviceConfidence: Float?,
+    onDeviceInferenceTimeMs: Long?,
     samples: Int,
     gifAsset: String,
     isPeak: Boolean,
     isConnected: Boolean,
+    isDemoMode: Boolean,
+    onToggleDemo: () -> Unit,
     onOpenConnect: () -> Unit,
     english: Boolean
 ) {
     val advice = if (!isConnected || assessment.bpm == null) {
-        if (english) "Connect your ESP32-S3 ECG device to begin. Sit still and keep electrodes well contacted."
-        else "Hãy kết nối thiết bị ESP32 ECG để bắt đầu. Ngồi yên và giữ điện cực tiếp xúc tốt nhé."
+        if (english) "Connect your ESP32-S3 ECG device or start Demo Mode to begin."
+        else "Hãy kết nối thiết bị ESP32 ECG hoặc bật Chế độ chạy thử (Demo) để bắt đầu nhé."
     } else {
         assessment.advice
     }
+
+    var modelDropdownExpanded by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -334,25 +387,23 @@ private fun HomeScreen(
                                 style = MaterialTheme.typography.titleSmall
                             )
                             Text(
-                                if (english) "Tap to pair with ESP32-S3 over BLE" else "Chạm để kết nối nhanh qua Bluetooth",
+                                if (english) "Tap to pair with ESP32-S3 or run Demo" else "Chạm để kết nối Bluetooth hoặc bật Demo",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
                             )
                         }
                     }
-                    Button(onClick = onOpenConnect) {
-                        Text(if (english) "Pair" else "Kết nối")
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(onClick = onToggleDemo) {
+                            Text(if (english) "Demo" else "Thử")
+                        }
+                        Button(onClick = onOpenConnect) {
+                            Text(if (english) "Pair" else "Kết nối")
+                        }
                     }
                 }
             }
         }
-
-        Text(
-            if (english) "Hello! I am your AI ECG Companion"
-            else "Xin chào, mình là Ami - Bạn đồng hành ECG",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold
-        )
 
         // Mascot Card with Advice
         Row(
@@ -377,6 +428,128 @@ private fun HomeScreen(
             GifCompanion(assetName = gifAsset, modifier = Modifier.size(116.dp))
         }
 
+        // ==========================================
+        // DUAL AI SOURCE & MODEL SELECTION CONTROLS
+        // ==========================================
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f))
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            if (english) "AI INFERENCE ENGINE" else "NGUỒN SUY LUẬN AI",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            if (english) "Toggle between ESP32 Chip & Android On-Device"
+                            else "Chuyển đổi giữa chip ESP32 và máy Android",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+
+                    // Source Switcher Toggle Chips
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = aiSource == AiSource.ESP32,
+                            onClick = { onSelectAiSource(AiSource.ESP32) },
+                            label = { Text("ESP32 AI", fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                        )
+                        FilterChip(
+                            selected = aiSource == AiSource.ON_DEVICE,
+                            onClick = { onSelectAiSource(AiSource.ON_DEVICE) },
+                            label = { Text("Android AI", fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                        )
+                    }
+                }
+
+                // If On-Device AI is active: Show model selector and metadata
+                if (aiSource == AiSource.ON_DEVICE) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    Text(
+                        if (english) "Select On-Device TFLite Model:" else "Chọn mô hình TFLite trên điện thoại:",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    ExposedDropdownMenuBox(
+                        expanded = modelDropdownExpanded,
+                        onExpandedChange = { modelDropdownExpanded = it }
+                    ) {
+                        OutlinedTextField(
+                            value = selectedModel.displayName,
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelDropdownExpanded) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor(),
+                            textStyle = MaterialTheme.typography.bodySmall
+                        )
+
+                        ExposedDropdownMenu(
+                            expanded = modelDropdownExpanded,
+                            onDismissRequest = { modelDropdownExpanded = false }
+                        ) {
+                            availableModels.forEach { meta ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text(meta.displayName, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                            Text(
+                                                "${meta.architecture} • ${meta.windowSize} mẫu • Acc: ${meta.accuracyPercent}%",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.outline
+                                            )
+                                        }
+                                    },
+                                    onClick = {
+                                        onSelectModel(meta)
+                                        modelDropdownExpanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    // Model Badge Details
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "Độ dài cửa sổ: ${selectedModel.windowSize} mẫu",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        Text(
+                            "Độ trễ: ${onDeviceInferenceTimeMs ?: 4} ms",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Text(
+                        selectedModel.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+            }
+        }
+
         Text(
             if (english) "Vital Signs & Edge AI Diagnostics"
             else "Chỉ số sinh hiệu & Chẩn đoán Edge AI",
@@ -395,12 +568,28 @@ private fun HomeScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        if (english) "Heart & CNN AI" else "Điện tim & AI Chẩn đoán",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFE95454)
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (english) "Heart & CNN AI" else "Điện tim & AI Chẩn đoán",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFE95454)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (aiSource == AiSource.ON_DEVICE) Color(0x3300E5A8) else Color(0x334DD0E1)
+                        ) {
+                            Text(
+                                if (aiSource == AiSource.ON_DEVICE) "Android AI" else "ESP32 AI",
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (aiSource == AiSource.ON_DEVICE) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                    }
+
                     if (isPeak) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
@@ -433,7 +622,7 @@ private fun HomeScreen(
                     Column(Modifier.weight(1.5f)) {
                         Text(if (english) "AAMI AI Rhythm" else "Phân loại nhịp AI", style = MaterialTheme.typography.labelMedium)
                         Text(
-                            aiClassName ?: (if (assessment.bpm == null) "--" else assessment.title),
+                            activeAiClassName ?: (if (assessment.bpm == null) "--" else assessment.title),
                             color = Color(0xFFE95454),
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleMedium
@@ -442,32 +631,73 @@ private fun HomeScreen(
                 }
 
                 // AI Probability distribution bars (N, S, V, F, Q)
-                if (aiClassPercentages != null && aiClassPercentages.size >= 5) {
+                if (activeAiClassPercentages != null && activeAiClassPercentages.size >= 5) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                    Text(
-                        if (english) "MIT-BIH Class Probabilities:" else "Xác suất 5 lớp chuẩn MIT-BIH:",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        val names = listOf("N", "S", "V", "F", "Q")
+                        Text(
+                            if (english) "AAMI EC57 Class Probabilities:" else "Xác suất 5 lớp AAMI EC57:",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        if (aiSource == AiSource.ON_DEVICE && onDeviceConfidence != null) {
+                            Text(
+                                "Tin cậy: ${String.format(Locale.US, "%.1f", onDeviceConfidence)}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+
+                    val classKeys = listOf("N", "S", "V", "F", "Q")
+                    val classLabels = listOf("Bình thường", "Sớm trên thất", "Ngoại tâm thất", "Kết hợp", "Không xác định")
+                    val classColors = listOf(Color(0xFF00E5A8), Color(0xFFFFB74D), Color(0xFFE57373), Color(0xFFBA68C8), Color(0xFF90A4AE))
+
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         for (i in 0 until 5) {
-                            val pct = aiClassPercentages.getOrNull(i) ?: 0f
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(names[i], fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                Text("${pct.toInt()}%", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                            val rawProb = activeAiClassPercentages.getOrNull(i) ?: 0f
+                            // Normalized percentage 0..100
+                            val pct = if (rawProb in 0f..1f) rawProb * 100f else rawProb
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = classKeys[i],
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.width(22.dp)
+                                )
+                                LinearProgressIndicator(
+                                    progress = { (pct / 100f).coerceIn(0f, 1f) },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(8.dp),
+                                    color = classColors[i],
+                                    trackColor = MaterialTheme.colorScheme.surfaceVariant
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "${String.format(Locale.US, "%.1f", pct)}%",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.width(46.dp)
+                                )
                             }
                         }
                     }
                 }
 
                 Text(
-                    if (english) "Trained on MIT-BIH Arrhythmia Database. Screening support only, not a medical diagnosis."
-                    else "Mô hình CNN 3-nhánh trên ESP32. Chỉ hỗ trợ sàng lọc sơ bộ, không thay thế chẩn đoán y khoa.",
-                    style = MaterialTheme.typography.bodySmall
+                    if (aiSource == AiSource.ON_DEVICE)
+                        "Mô hình TFLite: ${selectedModel.displayName}. Thuật toán Pan-Tompkins & chuẩn hóa nhịp 1:1 từ MATLAB."
+                    else
+                        "Mô hình CNN 3-nhánh chạy trên vi điều khiển ESP32-S3 qua luồng truyền tin BLE.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
                 )
             }
         }
@@ -508,21 +738,11 @@ private fun HomeScreen(
                     }
                 }
                 Text(
-                    if (english) "Real-time optical reflectance sensor on ESP32-S3 (I2C SDA=5, SCL=6)."
-                    else "Dữ liệu quang học thời gian thực truyền trực tiếp từ vi điều khiển ESP32-S3.",
+                    if (english) "Optical reflectance telemetry on ESP32-S3 (MAX30102 I2C)."
+                    else "Dữ liệu quang học thời gian thực đo từ cảm biến MAX30102.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-        }
-
-        // Card 3: Received Stream Details
-        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-            Text(
-                if (english) "ECG stream: ${samples / 125} seconds received @ 125 Hz (8ms cycle)"
-                else "Dữ liệu ECG: Đã nhận ${samples / 125} giây ở tần số 125 Hz (chu kỳ 8ms)",
-                Modifier.padding(14.dp),
-                style = MaterialTheme.typography.bodyMedium
-            )
         }
     }
 }
@@ -574,7 +794,7 @@ private fun DetailScreen(
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            selected?.name ?: if (english) "Disconnected" else "Chưa kết nối",
+                            selected?.name ?: if (english) "Device Active" else "Thiết bị",
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -602,16 +822,16 @@ private fun DetailScreen(
 
         Text(
             if (english) "Multi-Waveform Analysis & Comparison"
-            else "Phân tích & So sánh Đa Đồ thị ECG",
+            else "Phân tích & So sánh Đa Đồ thị ECG (3 Kênh)",
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold
         )
 
         // Waveform 1: Raw Signal from AD8232
         ChartPanel(
-            title = if (english) "1. RAW ECG SIGNAL (AD8232)" else "1. TÍN HIỆU ĐIỆN TIM THÔ (AD8232 ADC)",
-            subtitle = if (english) "Direct 0..4095 ADC samples with 50Hz mains & baseline wander"
-            else "Tín hiệu thô từ chân ADC GPIO 1, bao gồm nhiễu điện lưới 50Hz & trôi nền",
+            title = if (english) "1. RAW ECG SIGNAL (AD8232 ADC)" else "1. TÍN HIỆU ĐIỆN TIM THÔ (AD8232 ADC)",
+            subtitle = if (english) "Direct ADC samples with 50Hz mains & baseline wander"
+            else "Tín hiệu thô từ cảm biến AD8232, bao gồm nhiễu điện lưới 50Hz & trôi nền",
             samples = raw,
             color = Color(0xFFEF5350)
         )
@@ -619,17 +839,17 @@ private fun DetailScreen(
         // Waveform 2: Filtered on ESP32
         ChartPanel(
             title = if (english) "2. ESP32 HARDWARE FILTERED (NOTCH 50Hz)" else "2. TÍN HIỆU LỌC TỪ ESP32 (NOTCH 50Hz + BASELINE)",
-            subtitle = if (english) "Realtime DSP on ESP32-S3 Core 1: IIR Notch 50Hz + wander removal + smoothing"
-            else "Xử lý số tín hiệu trực tiếp trên Core 1 ESP32-S3: Lọc Notch 50Hz + chống trôi nền",
+            subtitle = if (english) "Realtime DSP on ESP32-S3 Core: IIR Notch 50Hz + wander removal + smoothing"
+            else "Xử lý số tín hiệu trực tiếp trên vi điều khiển: Notch 50Hz + chống trôi nền",
             samples = espFiltered,
             color = Color(0xFF00E5A8)
         )
 
-        // Waveform 3: Filtered on Android Device (For direct comparison!)
+        // Waveform 3: Filtered on Android Device
         ChartPanel(
             title = if (english) "3. ANDROID LOCAL FILTERED (COMPARISON)" else "3. TÍN HIỆU LỌC TRÊN ANDROID (ĐỐI CHIẾU)",
             subtitle = if (english) "Computed in Kotlin on Android for filter validation & cross-check"
-            else "Xử lý bằng thuật toán RealtimeEcgFilter cục bộ trên máy Android để kiểm chứng",
+            else "Xử lý bằng bộ lọc RealtimeEcgFilter cục bộ trên máy Android để kiểm chứng",
             samples = androidFiltered,
             color = Color(0xFF4DD0E1)
         )
@@ -907,25 +1127,117 @@ private fun TrendsScreen(modifier: Modifier, sessions: List<EcgSession>, english
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(
     modifier: Modifier,
     dark: Boolean,
     onDark: (Boolean) -> Unit,
     english: Boolean,
-    onEnglish: (Boolean) -> Unit
+    onEnglish: (Boolean) -> Unit,
+    isDemoMode: Boolean,
+    onToggleDemo: () -> Unit,
+    selectedModel: TfliteModelMeta,
+    availableModels: List<TfliteModelMeta>,
+    onSelectModel: (TfliteModelMeta) -> Unit
 ) {
+    var modelDropdownExpanded by remember { mutableStateOf(false) }
+
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            if (english) "Settings" else "Cài đặt",
+            if (english) "Settings & Configuration" else "Cài đặt & Cấu hình",
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold
         )
+
+        // Demo Simulation Mode Switch
+        Card {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(if (english) "Demo Simulation Mode" else "Chế độ Chạy thử (Demo Mode)", fontWeight = FontWeight.Bold)
+                    Text(
+                        if (english) "Simulate 125 Hz ECG with Pan-Tompkins & On-Device AI without hardware"
+                        else "Giả lập tín hiệu ECG 125Hz, chạy Pan-Tompkins & AI TFLite không cần phần cứng",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+                Switch(checked = isDemoMode, onCheckedChange = { onToggleDemo() })
+            }
+        }
+
+        // On-Device Model Switcher Card
+        Card {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    if (english) "Default On-Device AI Model" else "Mô hình AI On-Device mặc định",
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    if (english) "Select lightweight quantized INT8 model for on-device inference"
+                    else "Chọn mô hình lượng tử hóa INT8 tối ưu suy luận trực tiếp trên điện thoại",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+
+                ExposedDropdownMenuBox(
+                    expanded = modelDropdownExpanded,
+                    onExpandedChange = { modelDropdownExpanded = it }
+                ) {
+                    OutlinedTextField(
+                        value = selectedModel.displayName,
+                        onValueChange = {},
+                        readOnly = true,
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelDropdownExpanded) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(),
+                        textStyle = MaterialTheme.typography.bodySmall
+                    )
+
+                    ExposedDropdownMenu(
+                        expanded = modelDropdownExpanded,
+                        onDismissRequest = { modelDropdownExpanded = false }
+                    ) {
+                        availableModels.forEach { meta ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(meta.displayName, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Text(
+                                            "${meta.architecture} • ${meta.windowSize} mẫu • Acc: ${meta.accuracyPercent}%",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.outline
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    onSelectModel(meta)
+                                    modelDropdownExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         Card {
             Row(
@@ -964,16 +1276,16 @@ private fun SettingsScreen(
         Card {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
-                    if (english) "Biomedical Hardware Guide" else "Hướng dẫn phần cứng sinh hiệu",
+                    if (english) "Biomedical Hardware & AI Guide" else "Hướng dẫn phần cứng & AI y sinh",
                     fontWeight = FontWeight.Bold
                 )
                 Text(
                     if (english) "Target Device: ESP32-S3 (Service UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b)\n" +
                             "Sensors: AD8232 (ECG 125Hz) & MAX30102 (SpO2 & PPG 100Hz)\n" +
-                            "Edge AI: 3-branch CNN LeakyReLU with AAMI 5-class output."
+                            "Dual AI: ESP32 Hardware CNN + Android On-Device TFLite (Kachuee ResNet / Inception 3/4-Branch)."
                     else "Thiết bị kết nối: ESP32-S3 (Service UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b)\n" +
                             "Cảm biến: AD8232 (Điện tim 125Hz) & MAX30102 (Oxy & Mạch PPG 100Hz)\n" +
-                            "Mô hình AI: 3-nhánh CNN LeakyReLU phân loại 5 lớp theo chuẩn AAMI MIT-BIH.",
+                            "Kiến trúc Dual AI: Kết hợp đồng thời CNN trên chip ESP32 và TensorFlow Lite On-Device trên điện thoại Android.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -987,7 +1299,6 @@ private fun EcgWaveform(samples: List<Float>, modifier: Modifier, color: Color) 
         val w = size.width
         val h = size.height
 
-        // Draw background grid lines
         for (x in 0..10) {
             drawLine(Color(0x224DD0E1), Offset(x * w / 10f, 0f), Offset(x * w / 10f, h))
         }
@@ -1004,7 +1315,6 @@ private fun EcgWaveform(samples: List<Float>, modifier: Modifier, color: Color) 
 
         samples.forEachIndexed { i, s ->
             val x = i * w / (samples.size - 1)
-            // Keep waveform within bounds with a 10% safety margin top and bottom
             val normalized = (s - lo) / span
             val y = h - (normalized * (h * 0.80f) + (h * 0.10f))
             if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)

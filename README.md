@@ -1,47 +1,57 @@
 # 🩺 ECG & Vital Signs AI Monitor (Android / Jetpack Compose)
-## Tương thích toàn diện với Hệ thống Vi điều khiển ESP32-S3 (`ecg_monitor_ai`)
+## Tích hợp On-Device TensorFlow Lite & Tương thích Toàn diện Hệ thống Vi điều khiển ESP32-S3
 
-Ứng dụng di động Android hiện đại được xây dựng bằng **Kotlin**, **Jetpack Compose (Material 3)**, **Coroutines/Flow** và **Room Database** để kết nối, nhận dữ liệu thời gian thực và giám sát toàn diện hệ thống **ESP32-S3 ECG & Sinh hiệu Đa thông số AI**.
+Ứng dụng di động Android hiện đại được xây dựng bằng **Kotlin**, **Jetpack Compose (Material 3)**, **Coroutines/Flow**, **TensorFlow Lite On-Device** và **Room Database** để kết nối, nhận dữ liệu thời gian thực và giám sát toàn diện hệ thống **ESP32-S3 ECG & Sinh hiệu Đa thông số AI**.
 
 ---
 
-### 🌟 Điểm nổi bật & Tính năng mới
+### 🌟 Điểm nổi bật & Tính năng mới (Bản cập nhật v2.0 Dual AI)
 
-1. **Đồng bộ chuẩn giao thức BLE với `ecg_monitor_ai`**:
+1. **Kiến trúc Dual AI Engine (Chuyển đổi linh hoạt Toggle)**:
+   - **Nguồn 1 - ESP32 Hardware AI**: Tiếp nhận kết quả phân loại từ mô hình CNN 3-nhánh chạy trên vi điều khiển qua gói tin BLE.
+   - **Nguồn 2 - Android On-Device TFLite AI**: Chạy suy luận trực tiếp trên điện thoại bằng các mô hình định lượng INT8 siêu nhẹ, độc lập với vi điều khiển.
+   - Người dùng có thể dễ dàng chuyển đổi nguồn hiển thị trên UI bằng 1 cú chạm.
+
+2. **Tích hợp Top 5 Mô hình AI Benchmark từ MATLAB (`assets/models/`)**:
+   - ⚡ **`kachuee_residual_int8.tflite`** (187 mẫu @ 125Hz): Mạng Deep Residual 5 khối (Kachuee et al., 2018), độ chính xác **99.21%**, Macro F1 **0.9418**, dung lượng 90.2 KB.
+   - 🥇 **`model_3_branch_f32_leaky_int8.tflite`** (375 mẫu @ 125Hz): Top 1 Toàn diện MaxPool, Macro F1 **0.9401**, dung lượng 42.6 KB.
+   - ⚙️ **`model_4_branch_f16_relu_int8.tflite`** (375 mẫu @ 125Hz): Chuẩn TinyML cân bằng tối ưu giữa độ chính xác và tài nguyên, F1 **0.9299**, dung lượng 34.8 KB.
+   - 🪶 **`model_4_branch_f8_relu_int8.tflite`** (375 mẫu @ 125Hz): Quán quân siêu nhẹ chỉ 27.9 KB, suy luận thần tốc dưới 3 ms.
+   - 🌊 **`model_3_branch_f32_relu_avgpool_int8.tflite`** (375 mẫu @ 125Hz): Top 1 AveragePooling làm mượt đặc trưng, S-beat F1 **90.85%**.
+
+3. **Đồng bộ Chuỗi Tiền xử lý & Cắt nhịp 1:1 từ MATLAB**:
+   - **Dò đỉnh Pan-Tompkins thời gian thực (`PanTompkinsDetector.kt`)**: Khớp 1:1 với `pan_tompkins_qrs.m` (Bandpass HP 0.95 + LP 0.15, vi phân trễ 2 mẫu, cửa sổ MWI 18 mẫu, ngưỡng động thích nghi $Th=30$, tinh chỉnh cực trị đỉnh R trong $[-15, +5]$ mẫu).
+   - **Cắt nhịp thích ứng (`EcgSegmenter.kt`)**: Khớp 1:1 với `segment_heartbeats.m` (tự động cắt 375 mẫu hoặc 187 mẫu theo mô hình được chọn và chuẩn hóa Min-Max $[0.0, 1.0]$).
+
+4. **Chế độ Chạy thử Ngoại tuyến (Demo Simulation Mode)**:
+   - Cho phép người dùng bật/tắt nhanh chế độ Demo (`🧪 Demo`) ngay trên thanh tiêu đề hoặc Cài đặt.
+   - Tự động phát sóng ECG giả lập tần số 125 Hz (gồm cả nhịp bình thường và nhịp ngoại tâm thất PVC định kỳ), chạy qua Pan-Tompkins và kích hoạt On-Device TFLite để kiểm thử toàn diện mọi tính năng mà không cần phần cứng ESP32.
+
+5. **Đồng bộ chuẩn giao thức BLE với `ecg_monitor_ai`**:
    - **Tên thiết bị nhận diện**: `ESP32_ECG_AI_Tester`.
    - **GATT Service UUID**: `4fafc201-1fb5-459e-8fcc-c5c9c331914b`.
    - **GATT Characteristic UUID**: `beb5483e-36e1-4688-b7f5-ea07361b26a8`.
    - **Cơ chế phân giải chuỗi (ASCII Protocol)**: Tự động trích xuất các gói tin ở tần số 125 Hz:
      `R:<raw>|F:<filtered>|P:<0/1>|B:<bpm>|C:<class>|CN:<name>|Q:<p0,p1,p2,p3,p4>|SPO2:<spo2>|PBPM:<ppg>|IR:<ir>`
-   - Hỗ trợ cơ chế dự phòng (Fallback) tự động nhận diện gói tin nhị phân nếu cần.
 
-2. **Phân tích & So sánh Đa Đồ thị ECG (3 Panels)**:
+6. **Phân tích & So sánh Đa Đồ thị ECG (3 Kênh thời gian thực)**:
    - **Đồ thị 1 (Tín hiệu thô - Raw)**: Vẽ trực tiếp giá trị ADC thô từ cảm biến AD8232.
    - **Đồ thị 2 (Lọc từ ESP32)**: Tín hiệu đã lọc thời gian thực trên chip ESP32-S3 (Notch 50 Hz + chống trôi nền + làm mượt).
    - **Đồ thị 3 (Lọc trên Android)**: Tín hiệu chạy qua bộ lọc số `RealtimeEcgFilter` cục bộ của Android để đối chiếu và kiểm chứng chất lượng bộ lọc vi điều khiển.
 
-3. **Chẩn đoán Edge AI 5 lớp chuẩn AAMI / MIT-BIH**:
-   - Nhận diện nhịp tim phân loại trực tiếp từ mạng nơ-ron CNN 3 nhánh trên ESP32:
-     - **N**: Normal Beat (Nhịp xoang bình thường)
-     - **S**: Supraventricular Ectopic Beat (Ngoại tâm thu trên thất)
-     - **V**: Ventricular Ectopic Beat / PVC (Ngoại tâm thu thất)
-     - **F**: Fusion Beat (Nhịp kết hợp)
-     - **Q**: Paced / Unknown Beat (Nhịp máy tạo nhịp / Không xác định)
-   - Hiển thị trực quan xác suất % của cả 5 lớp.
-
-4. **Giám sát Sinh hiệu Toàn diện (MAX30102)**:
+7. **Giám sát Sinh hiệu Toàn diện (MAX30102)**:
    - Nồng độ oxy trong máu **SpO₂ (%)**.
    - Nhịp mạch quang học **PPG Pulse (BPM)**.
-   - Phát hiện nhịp tim đập thời gian thực (Heart Beat indicator).
+   - Phát hiện nhịp tim đập thời gian thực (Heart Beat indicator ❤️).
 
-5. **Linh vật Ami Mascot tương tác động**:
+8. **Linh vật Ami Mascot tương tác động**:
    - Tự động thay đổi biểu cảm GIF sinh động theo trạng thái kết nối và sức khỏe:
      - *Chưa kết nối*: `ami_sleep.gif` (ngủ)
      - *Đang quét / Kết nối*: `ami_question.gif` (thắc mắc)
      - *Nhịp bình thường*: `ami_happy.gif` (lấp lánh) hoặc `ami_nod.gif` (gật đầu)
      - *Loạn nhịp / Nhịp bất thường*: `ami_crying.gif` (khóc / lo lắng)
 
-6. **Lưu trữ Cục bộ (Room Database)**:
+9. **Lưu trữ Cục bộ (Room Database)**:
    - Lưu trữ các phiên đo ECG vào SQLite cục bộ qua Room DB (`ecg_sessions`).
    - Phân tích và biểu diễn xu hướng nhịp tim trung bình trong 7 ngày gần nhất.
 
@@ -54,11 +64,8 @@ Dự án đã được tích hợp sẵn workflow tại `.github/workflows/build
 1. **Khởi tạo và đẩy code lên GitHub**:
    Mở terminal tại thư mục `out/ecg_android_ai` và chạy:
    ```bash
-   git init
    git add .
-   git commit -m "feat: ECG AI Android Companion for ESP32-S3"
-   git branch -M main
-   git remote add origin <URL_REPOSITORY_GITHUB_CUA_BAN>
+   git commit -m "feat: Add On-Device TFLite inference, Pan-Tompkins detector and Top 5 AI models"
    git push -u origin main
    ```
 
@@ -84,16 +91,21 @@ Dự án đã được tích hợp sẵn workflow tại `.github/workflows/build
    - Bật Bluetooth và cấp quyền vị trí / thiết bị ở gần khi mở app.
    - Nhấn **Run 'app'** (Shift + F10).
 
-
 ---
 
 ### 📂 Cấu trúc mã nguồn chính
 
 - `app/src/main/java/com/example/ecgmonitor/`:
-  - `MainActivity.kt`: Toàn bộ giao diện Jetpack Compose (4 tabs: Trang chủ, Đồ thị so sánh, Xu hướng, Cài đặt) và Renderer GIF động cho Ami.
-  - `EcgViewModel.kt`: Quản lý luồng gói tin, 3 bộ đệm sóng, cập nhật sinh hiệu, điều khiển biểu cảm mascot Ami, và ghi Room DB.
+  - `MainActivity.kt`: Giao diện Jetpack Compose (HomeScreen với bộ chọn Dual AI, DetailScreen 3 đồ thị, TrendsScreen, SettingsScreen) và Renderer GIF động cho Ami.
+  - `EcgViewModel.kt`: Quản lý luồng gói tin, chuyển đổi nguồn AI (ESP32 vs Android), bộ đệm sóng, điều khiển biểu cảm mascot Ami, và ghi Room DB.
   - `ble/BleEcgClient.kt`: GATT Client quét và kết nối với `ESP32_ECG_AI_Tester`, bộ parser chuỗi ASCII thời gian thực 125 Hz.
+  - `domain/TfliteModelMeta.kt`: Định nghĩa thông tin, siêu tham số và danh mục 5 mô hình Top Benchmark.
+  - `domain/TfliteEcgClassifier.kt`: Quản lý vòng đời TensorFlow Lite Interpreter, nạp model INT8 từ assets và suy luận phân loại 5 lớp AAMI.
+  - `domain/PanTompkinsDetector.kt`: Thuật toán dò đỉnh QRS Pan-Tompkins thời gian thực đồng bộ 1:1 từ MATLAB.
+  - `domain/EcgSegmenter.kt`: Cắt nhịp tim thích ứng kích thước và chuẩn hóa Min-Max $[0.0, 1.0]$.
   - `domain/RealtimeEcgFilter.kt`: Bộ lọc số IIR cục bộ trên Android.
-  - `domain/EcgAnalysis.kt`: Thuật toán ước tính BPM và lời khuyên sức khoẻ kết hợp AI.
-  - `data/EcgDatabase.kt`: Định nghĩa bảng Room Database `ecg_sessions`.
+  - `domain/EcgDemoProcessor.kt`: Bộ phát sóng ECG giả lập 125 Hz ngoại tuyến cho chế độ Demo.
+  - `domain/EcgAnalysis.kt`: Ước tính BPM và đưa ra lời khuyên sức khoẻ.
+  - `data/EcgDatabase.kt`: Bảng Room Database `ecg_sessions`.
+- `app/src/main/assets/models/`: Chứa 5 file mô hình `.tflite` INT8 tối ưu hóa cho Edge AI.
 - `app/src/main/assets/`: 17 tệp GIF biểu cảm linh vật Ami.
