@@ -39,6 +39,7 @@ import com.example.ecgmonitor.ble.BleEcgClient
 import com.example.ecgmonitor.data.EcgDatabase
 import com.example.ecgmonitor.data.EcgSession
 import com.example.ecgmonitor.domain.EcgAssessment
+import kotlinx.coroutines.flow.*
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -442,7 +443,7 @@ private fun HomeScreen(
 
                 // AI Probability distribution bars (N, S, V, F, Q)
                 if (aiClassPercentages != null && aiClassPercentages.size >= 5) {
-                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                     Text(
                         if (english) "MIT-BIH Class Probabilities:" else "Xác suất 5 lớp chuẩn MIT-BIH:",
                         style = MaterialTheme.typography.labelSmall,
